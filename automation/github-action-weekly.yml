@@ -1,0 +1,26 @@
+# FREE weekly East Coast NOAA downloader.
+# Put this at .github/workflows/noaa-weekly.yml in a GitHub repo whose
+# automation/incoming/ folder syncs to your Cowork folder (repo in OneDrive, or
+# 'git pull' on the machine running Cowork). It pulls + filters the East Coast
+# yacht data every Monday and commits a small CSV the weekly Cowork task ingests.
+name: noaa-eastcoast-weekly
+on:
+  schedule:
+    - cron: "0 11 * * 1"      # Mondays 11:00 UTC
+  workflow_dispatch: {}
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install requests
+      - run: python automation/fetch_noaa.py
+      - name: commit the filtered East Coast file
+        run: |
+          git config user.name  "noaa-bot"
+          git config user.email "noaa-bot@users.noreply.github.com"
+          git add automation/incoming/AIS_EC_*.csv || true
+          git commit -m "weekly East Coast NOAA AIS pull" || echo "nothing new"
+          git push || true

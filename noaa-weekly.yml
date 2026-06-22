@@ -1,0 +1,26 @@
+name: noaa-eastcoast-weekly
+# Free weekly U.S. East Coast NOAA AIS pull. Runs on GitHub's servers, filters to
+# East Coast yacht traffic, and commits a small CSV into automation/incoming/.
+# SaintNAV's weekly Cowork task then pulls this repo and refreshes the tracker.
+on:
+  schedule:
+    - cron: "0 11 * * 1"        # Mondays 11:00 UTC
+  workflow_dispatch: {}          # lets you run it on demand from the Actions tab
+permissions:
+  contents: write                # allow the job to commit the data file
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install requests
+      - run: python automation/fetch_noaa.py
+      - name: commit the filtered East Coast file
+        run: |
+          git config user.name  "noaa-bot"
+          git config user.email "noaa-bot@users.noreply.github.com"
+          git add automation/incoming/AIS_EC_*.csv 2>/dev/null || true
+          git commit -m "weekly East Coast NOAA AIS pull" || echo "nothing new"
+          git push || true
