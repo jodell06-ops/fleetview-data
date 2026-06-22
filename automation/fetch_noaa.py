@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """East Coast NOAA AIS downloader.
 
 Finds the most recent NOAA Marine Cadastre national daily AIS file, streams it to
