@@ -33,6 +33,14 @@ INC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "incoming")
 os.makedirs(INC, exist_ok=True)
 BASE = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler"
 
+# coast.noaa.gov is fronted by a CDN (Akamai) that 403s the default python-requests
+# user-agent. Present a normal browser UA so probes and downloads are accepted.
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 SaintNAV/1.0"),
+    "Accept": "*/*",
+}
+
 # How many days back to scan. Start a little behind "today" (publishing lag) and
 # search far enough back to cross a year boundary if the current year isn't up yet.
 START_LAG_DAYS = 10
@@ -54,8 +62,12 @@ print("Looking for the latest available NOAA daily file...")
 for _ in range(MAX_LOOKBACK_DAYS):
     cand = url_for(d)
     try:
-        r = requests.head(cand, timeout=30, allow_redirects=True)
-        if r.status_code == 200:
+        # Probe with a 1-byte ranged GET (more reliable than HEAD through the CDN).
+        h = {**HEADERS, "Range": "bytes=0-0"}
+        r = requests.get(cand, headers=h, stream=True, timeout=30, allow_redirects=True)
+        code = r.status_code
+        r.close()
+        if code in (200, 206):
             url = cand; found_date = d; break
     except Exception:
         pass
@@ -70,7 +82,7 @@ print("Found:", url)
 # 2) stream the .zst to a temp file (avoids loading hundreds of MB into memory)
 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv.zst")
 got = 0
-with requests.get(url, stream=True, timeout=1800) as r:
+with requests.get(url, headers=HEADERS, stream=True, timeout=1800) as r:
     r.raise_for_status()
     for chunk in r.iter_content(1 << 20):
         tmp.write(chunk); got += len(chunk)
