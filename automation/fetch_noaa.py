@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """East Coast NOAA AIS downloader.
 
 Finds the most recent NOAA Marine Cadastre national daily AIS file, streams it to
@@ -90,23 +91,60 @@ tmp.close()
 print(f"Downloaded {got//(1<<20)} MB. Decompressing + filtering to East Coast yachts...")
 
 # 3) stream-decompress the Zstandard CSV and filter
+# read_across_frames=True is REQUIRED: NOAA's daily .csv.zst can be multi-frame, and
+# the default reader stops after the first frame (silently yielding almost no rows).
 out = os.path.join(INC, f"AIS_EC_{found_date.year}_{found_date.month:02d}_{found_date.day:02d}.csv")
 kept = total = 0
+header_seen = None
 dctx = zstd.ZstdDecompressor()
-with open(tmp.name, "rb") as fh, dctx.stream_reader(fh) as reader, \
+with open(tmp.name, "rb") as fh, \
+     dctx.stream_reader(fh, read_across_frames=True) as reader, \
      open(out, "w", newline="") as o:
     text = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
     rd = csv.DictReader(text)
+    header_seen = rd.fieldnames or []
+    # Resolve the columns we filter on case-insensitively, with known aliases, so a
+    # capitalization change in the feed can't silently zero out the result.
+    lut = {(c or "").lower(): c for c in header_seen}
+    def col(*names):
+        for n in names:
+            if n.lower() in lut: return lut[n.lower()]
+        return names[0]
+    C_LAT = col("LAT", "Latitude"); C_LON = col("LON", "Longitude")
+    C_VT  = col("VesselType", "VesselTypeCode"); C_LEN = col("Length", "LOA")
     wr = csv.DictWriter(o, fieldnames=KEEP); wr.writeheader()
+    samples = []
     for row in rd:
         total += 1
-        lat, lon = fnum(row.get("LAT")), fnum(row.get("LON"))
+        if len(samples) < 3:
+            samples.append(dict(row))
+        lat, lon = fnum(row.get(C_LAT)), fnum(row.get(C_LON))
         if lat is None or lon is None: continue
         if not (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX): continue
-        vt = int(fnum(row.get("VesselType")) or 0); loa = fnum(row.get("Length"))
+        vt = int(fnum(row.get(C_VT)) or 0); loa = fnum(row.get(C_LEN))
         if not (vt in YACHT_TYPES or (loa and loa >= MIN_LOA)): continue
         wr.writerow({k: row.get(k, "") for k in KEEP}); kept += 1
 os.unlink(tmp.name)
 print(f"Scanned {total:,} rows -> kept {kept:,} East Coast yacht fixes")
+if kept == 0:
+    # Self-diagnostic: a zero-row result writes a committed file we can inspect
+    # remotely, so we never have to dig through Action logs to learn why.
+    print("WARNING: kept 0 rows.")
+    print("  Detected columns:", header_seen)
+    print(f"  Filter used -> LAT='{C_LAT}' LON='{C_LON}' VesselType='{C_VT}' Length='{C_LEN}'")
+    print(f"  Scanned {total:,} total rows (if this is 0, decompression returned no data).")
+    diag = os.path.join(INC, "AIS_EC_DIAGNOSTIC.csv")
+    with open(diag, "w", newline="") as df:
+        df.write("# fetch_noaa.py diagnostic — kept 0 rows\n")
+        df.write(f"# source_url,{url}\n")
+        df.write(f"# scanned_rows,{total}\n")
+        df.write(f"# detected_columns,{'|'.join(header_seen)}\n")
+        df.write(f"# resolved_filter_cols,LAT={C_LAT};LON={C_LON};VesselType={C_VT};Length={C_LEN}\n")
+        df.write("# --- up to 3 raw sample rows below ---\n")
+        if samples:
+            w = csv.DictWriter(df, fieldnames=list(samples[0].keys()))
+            w.writeheader()
+            for s in samples: w.writerow(s)
+    print("  Wrote diagnostic:", diag)
 print(f"Wrote {out}  ({round(os.path.getsize(out)/1e6,2)} MB)")
 print("Done. Tell Claude 'process the new data', or wait for the Monday refresh.")
