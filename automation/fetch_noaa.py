@@ -13,7 +13,7 @@ the latest published day actually is (NOAA publishes on a multi-week-to-months l
   pip install requests zstandard
   python fetch_noaa.py
 """
-import os, sys, csv, io, datetime, tempfile, re
+import os, sys, csv, io, datetime, tempfile, re, zipfile, glob
 try:
     import requests
 except ImportError:
@@ -93,13 +93,15 @@ print(f"Downloaded {got//(1<<20)} MB. Decompressing + filtering to East Coast ya
 # 3) stream-decompress the Zstandard CSV and filter
 # read_across_frames=True is REQUIRED: NOAA's daily .csv.zst can be multi-frame, and
 # the default reader stops after the first frame (silently yielding almost no rows).
-out = os.path.join(INC, f"AIS_EC_{found_date.year}_{found_date.month:02d}_{found_date.day:02d}.csv")
+stem = f"AIS_EC_{found_date.year}_{found_date.month:02d}_{found_date.day:02d}"
+out_csv = os.path.join(tempfile.gettempdir(), stem + ".csv")   # working file (not committed)
+out_zip = os.path.join(INC, stem + ".zip")                     # committed artifact (fits GitHub's 100MB push limit)
 kept = total = 0
 header_seen = None
 dctx = zstd.ZstdDecompressor()
 with open(tmp.name, "rb") as fh, \
      dctx.stream_reader(fh, read_across_frames=True) as reader, \
-     open(out, "w", newline="") as o:
+     open(out_csv, "w", newline="") as o:
     text = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
     rd = csv.DictReader(text)
     header_seen = rd.fieldnames or []
@@ -121,6 +123,7 @@ with open(tmp.name, "rb") as fh, \
         "VesselType": ("VesselTypeCode", "ShipType"), "Length": ("LOA",),
         "BaseDateTime": ("BaseDateTimeUTC", "Timestamp", "DateTime"),
         "VesselName": ("Name", "ShipName"), "CallSign": ("Callsign",),
+        "TransceiverClass": ("Transceiver", "TransceiverClassCode"),
     }
     def col(*names):
         for n in names:
@@ -175,10 +178,25 @@ if kept == 0 or nonblank == 0:
     # Remove the blank/garbage output so it can NEVER be committed or ingested as "real".
     # The committed diagnostic (AIS_EC_DIAGNOSTIC.csv) still surfaces the failure remotely.
     try:
-        if os.path.exists(out):
-            os.unlink(out); print("  Removed blank output so it is not presented as real:", out)
+        if os.path.exists(out_csv):
+            os.unlink(out_csv); print("  Removed blank output so it is not presented as real:", out_csv)
     except Exception as e:
         print("  WARN could not remove blank output:", e)
     sys.exit("fetch_noaa.py: no real rows extracted — see diagnostic above.")
-print(f"Wrote {out}  ({round(os.path.getsize(out)/1e6,2)} MB)")
+
+# Success: compress to a .zip. The raw CSV (~190 MB) exceeds GitHub's 100 MB push limit,
+# so the Action could never commit it; zipped it is ~30-40 MB. The pipeline (noaa_ingest /
+# refresh_pipeline) reads .zip natively, so nothing downstream changes.
+raw_mb = round(os.path.getsize(out_csv) / 1e6, 2)
+with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    z.write(out_csv, arcname=stem + ".csv")
+os.unlink(out_csv)
+# Remove any stale AIS_EC_* outputs (e.g. a previous run's blank .csv) so `git add -A`
+# records the swap and only the fresh compressed file remains.
+for stale in glob.glob(os.path.join(INC, "AIS_EC_*.csv")) + glob.glob(os.path.join(INC, "AIS_EC_*.zip")):
+    if os.path.abspath(stale) != os.path.abspath(out_zip):
+        try: os.unlink(stale); print("  Removed stale output:", os.path.basename(stale))
+        except Exception as e: print("  WARN could not remove stale", stale, e)
+zip_mb = round(os.path.getsize(out_zip) / 1e6, 2)
+print(f"Wrote {out_zip}  ({zip_mb} MB zipped, from {raw_mb} MB CSV)")
 print("Done. Tell Claude 'process the new data', or wait for the Monday refresh.")
