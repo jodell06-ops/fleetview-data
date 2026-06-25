@@ -110,10 +110,23 @@ with open(tmp.name, "rb") as fh, \
         for n in names:
             if n.lower() in lut: return lut[n.lower()]
         return names[0]
-    C_LAT = col("LAT", "Latitude"); C_LON = col("LON", "Longitude")
-    C_VT  = col("VesselType", "VesselTypeCode"); C_LEN = col("Length", "LOA")
+    # Known NOAA aliases for renamed/recased columns across feed format changes.
+    ALIASES = {
+        "LAT": ("LAT", "Latitude"), "LON": ("LON", "Longitude"),
+        "VesselType": ("VesselType", "VesselTypeCode"), "Length": ("Length", "LOA"),
+        "BaseDateTime": ("BaseDateTime", "BaseDateTimeUTC"),
+        "VesselName": ("VesselName", "Name"), "CallSign": ("CallSign", "Callsign"),
+    }
+    # Resolve EVERY output column to the source file's ACTUAL header (case/alias-robust).
+    # BUGFIX 2026-06-22: the writer previously used the canonical KEEP names directly
+    # (row.get(k)), so when NOAA recased/renamed its headers the filter still matched
+    # (it used the resolver) but every written field came back blank -> 1.28M empty rows.
+    # Resolving the write path too means a recased feed can never again yield blank output.
+    SRC = {k: col(*ALIASES.get(k, (k,))) for k in KEEP}
+    C_LAT, C_LON, C_VT, C_LEN = SRC["LAT"], SRC["LON"], SRC["VesselType"], SRC["Length"]
     wr = csv.DictWriter(o, fieldnames=KEEP); wr.writeheader()
     samples = []
+    nonblank = 0
     for row in rd:
         total += 1
         if len(samples) < 3:
@@ -123,13 +136,17 @@ with open(tmp.name, "rb") as fh, \
         if not (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX): continue
         vt = int(fnum(row.get(C_VT)) or 0); loa = fnum(row.get(C_LEN))
         if not (vt in YACHT_TYPES or (loa and loa >= MIN_LOA)): continue
-        wr.writerow({k: row.get(k, "") for k in KEEP}); kept += 1
+        vals = {k: row.get(SRC[k], "") for k in KEEP}
+        wr.writerow(vals); kept += 1
+        if (vals.get("MMSI") or "").strip(): nonblank += 1
 os.unlink(tmp.name)
-print(f"Scanned {total:,} rows -> kept {kept:,} East Coast yacht fixes")
-if kept == 0:
-    # Self-diagnostic: a zero-row result writes a committed file we can inspect
-    # remotely, so we never have to dig through Action logs to learn why.
-    print("WARNING: kept 0 rows.")
+print(f"Scanned {total:,} rows -> kept {kept:,} East Coast yacht fixes "
+      f"({nonblank:,} with a non-blank MMSI)")
+if kept == 0 or nonblank == 0:
+    # Self-diagnostic: a zero-row OR all-blank result writes a committed file we can
+    # inspect remotely, so we never have to dig through Action logs to learn why.
+    # (all-blank == the recased-header bug that produced 1.28M empty rows.)
+    print(f"WARNING: kept {kept:,} rows but {nonblank:,} had real data — writing diagnostic.")
     print("  Detected columns:", header_seen)
     print(f"  Filter used -> LAT='{C_LAT}' LON='{C_LON}' VesselType='{C_VT}' Length='{C_LEN}'")
     print(f"  Scanned {total:,} total rows (if this is 0, decompression returned no data).")
@@ -146,5 +163,13 @@ if kept == 0:
             w.writeheader()
             for s in samples: w.writerow(s)
     print("  Wrote diagnostic:", diag)
+    # Remove the blank/garbage output so it can NEVER be committed or ingested as "real".
+    # The committed diagnostic (AIS_EC_DIAGNOSTIC.csv) still surfaces the failure remotely.
+    try:
+        if os.path.exists(out):
+            os.unlink(out); print("  Removed blank output so it is not presented as real:", out)
+    except Exception as e:
+        print("  WARN could not remove blank output:", e)
+    sys.exit("fetch_noaa.py: no real rows extracted — see diagnostic above.")
 print(f"Wrote {out}  ({round(os.path.getsize(out)/1e6,2)} MB)")
 print("Done. Tell Claude 'process the new data', or wait for the Monday refresh.")
