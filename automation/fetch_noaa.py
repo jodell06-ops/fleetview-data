@@ -13,7 +13,7 @@ the latest published day actually is (NOAA publishes on a multi-week-to-months l
   pip install requests zstandard
   python fetch_noaa.py
 """
-import os, sys, csv, io, datetime, tempfile
+import os, sys, csv, io, datetime, tempfile, re
 try:
     import requests
 except ImportError:
@@ -105,25 +105,34 @@ with open(tmp.name, "rb") as fh, \
     header_seen = rd.fieldnames or []
     # Resolve the columns we filter on case-insensitively, with known aliases, so a
     # capitalization change in the feed can't silently zero out the result.
-    lut = {(c or "").lower(): c for c in header_seen}
+    # Resolve headers by NORMALIZING away case, spaces, underscores and punctuation, so
+    # "BaseDateTime" / "base_date_time" / "Base Date Time" / "BASEDATETIME" all match.
+    # BUGFIX 2026-06-22: the writer used canonical KEEP names directly (row.get(k)); a
+    # recased NOAA feed made every written field blank -> 1.28M empty rows.
+    # BUGFIX 2026-06-24: a case-only resolver still left 5 multi-word columns
+    # (BaseDateTime, VesselName, CallSign, VesselType, TransceiverClass) unmatched and
+    # blank, dropping all timestamps. Normalizing separators matches them regardless of
+    # NOAA's naming style (camelCase / snake_case / spaced).
+    def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    lut = {_norm(c): c for c in header_seen}
+    # Aliases for columns NOAA may name with genuinely different words.
+    ALIASES = {
+        "LAT": ("Latitude",), "LON": ("Longitude",),
+        "VesselType": ("VesselTypeCode", "ShipType"), "Length": ("LOA",),
+        "BaseDateTime": ("BaseDateTimeUTC", "Timestamp", "DateTime"),
+        "VesselName": ("Name", "ShipName"), "CallSign": ("Callsign",),
+    }
     def col(*names):
         for n in names:
-            if n.lower() in lut: return lut[n.lower()]
+            if _norm(n) in lut: return lut[_norm(n)]
         return names[0]
-    # Known NOAA aliases for renamed/recased columns across feed format changes.
-    ALIASES = {
-        "LAT": ("LAT", "Latitude"), "LON": ("LON", "Longitude"),
-        "VesselType": ("VesselType", "VesselTypeCode"), "Length": ("Length", "LOA"),
-        "BaseDateTime": ("BaseDateTime", "BaseDateTimeUTC"),
-        "VesselName": ("VesselName", "Name"), "CallSign": ("CallSign", "Callsign"),
-    }
-    # Resolve EVERY output column to the source file's ACTUAL header (case/alias-robust).
-    # BUGFIX 2026-06-22: the writer previously used the canonical KEEP names directly
-    # (row.get(k)), so when NOAA recased/renamed its headers the filter still matched
-    # (it used the resolver) but every written field came back blank -> 1.28M empty rows.
-    # Resolving the write path too means a recased feed can never again yield blank output.
-    SRC = {k: col(*ALIASES.get(k, (k,))) for k in KEEP}
+    # Resolve EVERY output column to the source file's ACTUAL header (separator/case/alias-robust).
+    SRC = {k: col(k, *ALIASES.get(k, ())) for k in KEEP}
     C_LAT, C_LON, C_VT, C_LEN = SRC["LAT"], SRC["LON"], SRC["VesselType"], SRC["Length"]
+    print("  detected source columns:", header_seen)
+    print("  resolved mapping:", {k: SRC[k] for k in KEEP})
+    unresolved = [k for k in KEEP if SRC[k] not in header_seen]
+    if unresolved: print("  WARNING unresolved output columns (will be blank):", unresolved)
     wr = csv.DictWriter(o, fieldnames=KEEP); wr.writeheader()
     samples = []
     nonblank = 0
